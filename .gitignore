@@ -4,6 +4,7 @@
 *.env
 ADO to JIRA/config.json
 ADO to JIRA/logs/
+ADO to JIRA/run_state.json
 
 # Generated output
 *.csv

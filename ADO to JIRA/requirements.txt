@@ -1,0 +1,4 @@
+requests
+azure-devops
+msrest
+requests-toolbelt

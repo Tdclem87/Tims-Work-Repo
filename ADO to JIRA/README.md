@@ -27,8 +27,10 @@ Keep the local working script and local config file off Git. The public repo sho
 ## Install dependencies
 
 ```powershell
-python -m pip install requests azure-devops msrest requests-toolbelt
+python -m pip install -r requirements.txt
 ```
+
+The dependency list is stored in `requirements.txt` next to the scripts.
 
 ## What the sync does
 
@@ -36,6 +38,7 @@ python -m pip install requests azure-devops msrest requests-toolbelt
 - Converts HTML comment content into readable Jira text.
 - Uploads work item attachments and comment-linked screenshots to Jira.
 - Streams attachment downloads and uploads instead of loading entire files into memory.
+- Reuses one HTTP session per run for connection pooling.
 - Stores a clickable Jira link when an attachment exceeds the configured size limit.
 - Avoids reposting matching Jira comments and existing attachment filenames.
 - Supports multiple Azure DevOps organizations using configurable Jira prefixes.
@@ -165,10 +168,11 @@ python clean_ado_to_jira_sync.py
 Double-click `ADO to Jira Sync.cmd` to launch the application. The launcher prefers Windows PowerShell and falls back to a Command Prompt loop if PowerShell is unavailable. It:
 
 - uses `powershell.exe` when it is available
+- prefers the repository virtual environment at `.venv\Scripts\python.exe` when available
 - uses the local `ado_to_jira_sync.py` working copy when it is available
 - falls back to `clean_ado_to_jira_sync.py` for a public-safe checkout
 - keeps the console open after each run
-- starts the first prompt again after the run finishes
+- automatically starts the first prompt again after the run finishes
 
 You can also start it from PowerShell or Command Prompt:
 
@@ -186,9 +190,13 @@ The CSV export is written next to the script as `work_item_comments.csv`.
 
 ## Local activity logs
 
-Each script writes activity and error information to a local `logs` folder next to the script. The log file is named `activity.log` and rotates at midnight. The current file plus up to 89 previous daily files are retained, so logs are kept for no more than 90 daily files.
+Each script writes activity and error information to a local `logs` folder next to the script. The log file is named `activity.log` and rotates at midnight. The current file plus up to 89 previous daily files are retained, so logs are kept for no more than 90 daily files. Operational messages also appear in the console through the logging system, while prompts and interactive setup instructions remain direct user prompts.
 
 Logs include setup events, retrieval counts, preview and cancellation decisions, upload/post results, and error details. Tokens, PAT values, and other credential values are never written to the logs. The `logs` folder is ignored by Git and should remain local.
+
+Each script invocation also receives a short session ID. Every log entry includes that ID, making it possible to isolate one run when several runs are present in the same daily log file.
+
+The script also keeps a local `run_state.json` file with the latest session status, target issue, work-item IDs, preview choice, counts, and outcome. It contains no credentials, is updated atomically, and is ignored by Git. A `running` status after an interruption indicates that the previous session did not finish normally.
 
 ## Security guidance
 

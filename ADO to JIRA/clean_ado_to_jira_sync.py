@@ -4,7 +4,9 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from logging.handlers import TimedRotatingFileHandler
@@ -19,12 +21,36 @@ from requests_toolbelt.multipart.encoder import MultipartEncoder
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 LOG_DIR = Path(__file__).resolve().parent / "logs"
+STATE_PATH = Path(__file__).resolve().parent / "run_state.json"
 DEFAULT_MAX_ATTACHMENT_SIZE_MB = 100
 ADO_CONFIGS = {}
 JIRA_BASE_URL = ""
 JIRA_EMAIL = ""
 MAX_ATTACHMENT_BYTES = DEFAULT_MAX_ATTACHMENT_SIZE_MB * 1024 * 1024
+SESSION_ID = uuid.uuid4().hex[:12]
+SESSION = requests.Session()
+RUN_STATE = {}
 LOGGER = logging.getLogger("ado_to_jira_sync")
+
+
+class SessionLogFilter(logging.Filter):
+    def filter(self, record):
+        record.session_id = SESSION_ID
+        return True
+
+
+def update_run_state(status, **updates):
+    RUN_STATE.update(
+        {
+            "status": status,
+            "session_id": SESSION_ID,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            **updates,
+        }
+    )
+    temporary_path = STATE_PATH.with_suffix(".tmp")
+    temporary_path.write_text(json.dumps(RUN_STATE, indent=2), encoding="utf-8")
+    temporary_path.replace(STATE_PATH)
 
 
 def configure_logging():
@@ -40,9 +66,15 @@ def configure_logging():
         encoding="utf-8",
     )
     handler.setFormatter(
-        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        logging.Formatter(
+            "%(asctime)s [%(levelname)s] [session=%(session_id)s] %(message)s"
+        )
     )
+    handler.addFilter(SessionLogFilter())
     LOGGER.addHandler(handler)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    LOGGER.addHandler(console_handler)
     LOGGER.setLevel(logging.INFO)
     LOGGER.propagate = False
     LOGGER.info("Logging started.")
@@ -373,7 +405,7 @@ def get_work_item_comments(work_item_tracking_client, work_item_id, pat):
         params = {"$top": 100}
         if continuation_token:
             params["continuationToken"] = continuation_token
-        response = requests.get(
+        response = SESSION.get(
             comments_link,
             params=params,
             auth=("", pat),
@@ -387,7 +419,7 @@ def get_work_item_comments(work_item_tracking_client, work_item_id, pat):
 
 
 def get_work_item_attachments(organization_url, work_item_id, pat):
-    response = requests.get(
+    response = SESSION.get(
         f"{organization_url}/_apis/wit/workitems/{work_item_id}",
         params={"$expand": "relations", "api-version": "7.1"},
         auth=("", pat),
@@ -408,7 +440,7 @@ def get_work_item_attachments(organization_url, work_item_id, pat):
 
 
 def get_jira_issue_data(issue_key, jira_api_token):
-    response = requests.get(
+    response = SESSION.get(
         f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}",
         params={"fields": "attachment,comment"},
         auth=(JIRA_EMAIL, jira_api_token),
@@ -429,7 +461,7 @@ def upload_jira_attachment(
 
     temporary_path = None
     try:
-        with requests.get(
+        with SESSION.get(
             attachment["url"],
             auth=("", pat),
             stream=True,
@@ -474,7 +506,7 @@ def upload_jira_attachment(
                     "file": (filename, attachment_file, content_type),
                 }
             )
-            upload_response = requests.post(
+            upload_response = SESSION.post(
                 f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/attachments",
                 auth=(JIRA_EMAIL, jira_api_token),
                 headers={
@@ -548,7 +580,7 @@ def add_jira_comment(
                     ],
                 }
             )
-    response = requests.post(
+    response = SESSION.post(
         f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/comment",
         auth=(JIRA_EMAIL, jira_api_token),
         headers={
@@ -628,7 +660,8 @@ def write_comments_csv(comments):
 
 def main():
     configure_logging()
-    LOGGER.info("Sync run started.")
+    update_run_state("running")
+    LOGGER.info("Sync session started.")
     ensure_setup()
     ensure_environment_variables()
     jira_api_token = get_required_environment_variable("JIRA_API_TOKEN")
@@ -656,7 +689,13 @@ def main():
         ).split(",")
         if work_item_input.strip()
     ]
+    update_run_state(
+        "running",
+        jira_issue_key=jira_issue_key,
+        work_item_ids=work_item_inputs,
+    )
     config = ADO_CONFIGS[jira_prefix]
+    LOGGER.info("Target Jira issue: %s", jira_issue_key)
     work_items = []
     for work_item_input in work_item_inputs:
         if not work_item_input.isdigit():
@@ -672,6 +711,7 @@ def main():
             }
         )
     preview_first = input("Preview first? (y/n): ").strip().lower() in {"y", "yes"}
+    update_run_state("running", preview_first=preview_first)
 
     comments = []
     attachments = []
@@ -761,18 +801,17 @@ def main():
                 },
             )
 
-    print(f"Found {len(comments)} ADO comments.")
-    print(f"Found {len(unique_attachments)} unique ADO attachments.")
-    print(f"Target Jira issue: {jira_issue_key}")
+    LOGGER.info("Found %d ADO comments.", len(comments))
+    LOGGER.info("Found %d unique ADO attachments.", len(unique_attachments))
+    LOGGER.info("Target Jira issue: %s", jira_issue_key)
     if failures:
-        print(f"Encountered {len(failures)} retrieval failure(s).")
+        LOGGER.warning("Encountered %d retrieval failure(s).", len(failures))
     if preview_first:
-        print("Preview complete. No Jira changes have been made yet.")
         LOGGER.info("Preview displayed before Jira posting.")
 
     if input("Continue posting to Jira? (y/n): ").strip().lower() not in {"y", "yes"}:
+        update_run_state("cancelled", reason="User declined Jira posting.")
         LOGGER.info("Sync cancelled before Jira posting.")
-        print("Cancelled; no Jira updates were made.")
         return
 
     uploaded_by_url = {}
@@ -786,7 +825,6 @@ def main():
                 jira_api_token,
                 existing_filenames,
             )
-            print(message)
             LOGGER.info(message)
             if fallback_link:
                 fallback_links[fallback_link["url"]] = fallback_link
@@ -798,7 +836,6 @@ def main():
         except (requests.RequestException, KeyError) as error:
             LOGGER.error("Attachment upload failed for %s: %s", attachment["name"], error)
             failures.append(f"Attachment {attachment['name']}: {error}")
-            print(f"Failed attachment {attachment['name']}: {error}")
 
     posted_count = 0
     skipped_count = 0
@@ -841,7 +878,6 @@ def main():
         except requests.RequestException as error:
             LOGGER.error("Jira comment post failed for %s: %s", comment['CommentCreatedBy'], error)
             failures.append(f"Comment from {comment['CommentCreatedBy']}: {error}")
-            print(f"Failed comment from {comment['CommentCreatedBy']}: {error}")
 
     if fallback_links:
         link_header = "[ADO_TO_JIRA_LINKS] Attachments not uploaded"
@@ -859,17 +895,21 @@ def main():
             )
             LOGGER.info("Posted %d oversized attachment link(s).", len(fallback_links))
 
-    print(f"Posted {posted_count} Jira comments; skipped {skipped_count} duplicates.")
     LOGGER.info(
         "Sync run completed: posted %d comment(s), skipped %d duplicate(s), failures %d.",
         posted_count,
         skipped_count,
         len(failures),
     )
+    update_run_state(
+        "completed",
+        posted_comments=posted_count,
+        skipped_duplicates=skipped_count,
+        failures=len(failures),
+    )
     if failures:
-        print("Failures:")
         for failure in failures:
-            print(f"- {failure}")
+            LOGGER.error("Failure: %s", failure)
 
 
 if __name__ == "__main__":
@@ -877,5 +917,6 @@ if __name__ == "__main__":
         main()
     except Exception as error:
         configure_logging()
+        update_run_state("failed", error=str(error))
         LOGGER.exception("Run stopped with error: %s", error)
         raise SystemExit(f"Error: {error}") from error

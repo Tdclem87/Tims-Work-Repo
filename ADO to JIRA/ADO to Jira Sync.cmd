@@ -10,16 +10,19 @@ if %errorlevel% equ 0 (
 
 set "SCRIPT=ado_to_jira_sync.py"
 if not exist "%SCRIPT%" set "SCRIPT=clean_ado_to_jira_sync.py"
+set "PYTHON=%~dp0..\..\.venv\Scripts\python.exe"
+if not exist "%PYTHON%" set "PYTHON=python"
 
 :restart
 cls
 echo.
 echo ===== Azure DevOps to Jira Sync =====
 echo Starting a new run with %SCRIPT%...
+echo Using Python: %PYTHON%
 echo.
-python "%SCRIPT%"
+"%PYTHON%" "%SCRIPT%"
 echo.
 echo Run completed.
 echo The session will restart automatically.
-pause
+echo Restarting from the first prompt...
 goto restart
