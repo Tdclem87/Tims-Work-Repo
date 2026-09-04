@@ -583,7 +583,7 @@ def main():
                 "pat": get_required_environment_variable(pat_env_var),
             }
         )
-    preview_only = input("Preview only? (y/n): ").strip().lower() in {"y", "yes"}
+    preview_first = input("Preview first? (y/n): ").strip().lower() in {"y", "yes"}
 
     comments = []
     attachments = []
@@ -671,11 +671,10 @@ def main():
     print(f"Target Jira issue: {jira_issue_key}")
     if failures:
         print(f"Encountered {len(failures)} retrieval failure(s).")
-    if preview_only:
-        print("Preview only: no Jira comments or attachments will be changed.")
-        return
+    if preview_first:
+        print("Preview complete. No Jira changes have been made yet.")
 
-    if input("Continue with Jira updates? (y/n): ").strip().lower() not in {"y", "yes"}:
+    if input("Continue posting to Jira? (y/n): ").strip().lower() not in {"y", "yes"}:
         print("Cancelled; no Jira updates were made.")
         return
 

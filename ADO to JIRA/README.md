@@ -145,7 +145,25 @@ From the folder containing the script:
 python clean_ado_to_jira_sync.py
 ```
 
-The script will ask for the Jira issue key. Enter the issue key for one of the configured prefixes.
+### Use the automatic Windows launcher
+
+Double-click `ADO to Jira Sync.cmd` to launch the application. The launcher prefers Windows PowerShell and falls back to a Command Prompt loop if PowerShell is unavailable. It:
+
+- uses `powershell.exe` when it is available
+- uses the local `ado_to_jira_sync.py` working copy when it is available
+- falls back to `clean_ado_to_jira_sync.py` for a public-safe checkout
+- keeps the console open after each run
+- starts the first prompt again after the run finishes
+
+You can also start it from PowerShell or Command Prompt:
+
+```powershell
+& ".\ADO to Jira Sync.cmd"
+```
+
+The launcher does not contain credentials. Tokens continue to come from Windows environment variables.
+
+The script will ask for the Jira issue key and work item IDs. It then asks `Preview first?` and displays the number of comments, attachments, and retrieval failures found. After reviewing the preview, answer `Continue posting to Jira?` with `Y` to make the Jira changes or `N` to cancel.
 
 You can also type `R` at the Jira key prompt to view this README from the script.
 
