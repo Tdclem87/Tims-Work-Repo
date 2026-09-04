@@ -2,6 +2,7 @@ import csv
 import json
 import os
 import re
+import subprocess
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
@@ -177,14 +178,141 @@ def view_readme():
 
 def get_jira_issue_key():
     while True:
-        # CHANGE THIS: update the accepted prefixes if your Jira projects differ.
+        valid_prefixes = " / ".join(
+            sorted(prefix.upper() for prefix in ADO_CONFIGS.keys())
+        )
         value = get_required_input(
-            "Jira issue key (ORG1- or ORG2-, or R to view README): "
+            f"Jira issue key ({valid_prefixes}, or R to view README): "
         )
         if value.lower() == "r":
             view_readme()
             continue
         return value
+
+
+def launch_windows_environment_variables():
+    if os.name != "nt":
+        print("Windows environment variables can only be opened on Windows.")
+        return
+
+    try:
+        subprocess.run(
+            ["rundll32.exe", "sysdm.cpl,EditEnvironmentVariables"],
+            check=False,
+        )
+        print("Opened the Windows Environment Variables window.")
+    except OSError as error:
+        print(f"Could not open the environment variables editor: {error}")
+
+
+def prompt_for_configuration():
+    print("\nInitial setup is required.")
+    print("This will create a local config file and save it next to this script.")
+    print("Your PATs and Jira token will stay in Windows environment variables.")
+
+    while True:
+        try:
+            org_count = int(
+                get_required_input(
+                    "How many Azure DevOps organizations do you want to configure? "
+                )
+            )
+            if org_count <= 0:
+                raise ValueError("Organization count must be at least 1.")
+            break
+        except ValueError:
+            print("Please enter a whole number greater than 0.")
+
+    ado_configs = {}
+    for index in range(1, org_count + 1):
+        while True:
+            prefix = get_required_input(
+                f"Organization {index} Jira prefix (for example MBSD): "
+            ).strip().upper()
+            if prefix:
+                break
+        while True:
+            organization_url = get_required_input(
+                f"Organization {index} Azure DevOps URL (for example https://dev.azure.com/your-org): "
+            )
+            if organization_url:
+                break
+        ado_configs[prefix] = {"organization_url": organization_url}
+
+    jira_base_url = get_required_input(
+        "Jira base URL (for example https://your-company.atlassian.net): "
+    )
+    jira_email = get_required_input("Jira email address: ")
+
+    configuration = {
+        "ado_configs": ado_configs,
+        "jira": {
+            "base_url": jira_base_url,
+            "email": jira_email,
+        },
+    }
+    CONFIG_PATH.write_text(json.dumps(configuration, indent=2), encoding="utf-8")
+    print(f"Configuration saved to: {CONFIG_PATH}")
+
+
+def ensure_environment_variables():
+    required_vars = {"JIRA_API_TOKEN": "Jira API token"}
+    for prefix in ADO_CONFIGS.keys():
+        required_vars[f"AZDO_{prefix.upper()}_PAT"] = f"{prefix} Azure DevOps PAT"
+
+    missing = [name for name in required_vars if not os.environ.get(name)]
+    if not missing:
+        return
+
+    print("\nMissing environment variables:")
+    for name in missing:
+        print(f"- {name} ({required_vars[name]})")
+
+    print("\nCreate the required tokens if you do not already have them:")
+    print("Jira API token:")
+    print("1. Open https://id.atlassian.com/manage-profile/security/api-tokens")
+    print("2. Select Create API token, enter a label, and create the token.")
+    print("3. Copy it immediately; Atlassian will not show it again.")
+    print("4. Store it as JIRA_API_TOKEN in Windows environment variables.")
+    print("Azure DevOps PAT, once for each organization:")
+    print("1. Sign in to the Azure DevOps organization.")
+    print("2. Select your profile icon, then User settings > Personal access tokens.")
+    print("3. Select New Token, enter a name and expiration date.")
+    print("4. Choose the organization and use the minimum Work Items read access needed by this tool.")
+    print("5. Create the PAT and copy it immediately; Azure DevOps will not show it again.")
+    print("6. Store it as AZDO_<PREFIX>_PAT, using each configured prefix.")
+
+    print("\nAdd the missing values in Windows:")
+    print("1. Press the Windows key and search for 'environment variables'.")
+    print("2. Open 'Edit the system environment variables'.")
+    print("3. Select 'Environment Variables'.")
+    print("4. Under User variables, select 'New'.")
+    print("5. Enter each missing variable name exactly as listed above.")
+    print("6. Enter the matching Jira API token or Azure DevOps PAT as its value.")
+    print("7. Select OK on each window to save the changes.")
+    print("8. Close and reopen PowerShell, Command Prompt, or VS Code.")
+
+    response = input(
+        "Open Windows Environment Variables now to add them? (y/n): "
+    ).strip().lower()
+    if response in {"y", "yes"}:
+        launch_windows_environment_variables()
+
+    input("After you add the missing values, press Enter to continue...")
+
+
+def ensure_setup():
+    if not CONFIG_PATH.exists():
+        prompt_for_configuration()
+        load_configuration()
+        return
+
+    try:
+        load_configuration()
+    except RuntimeError as error:
+        print(f"Configuration check failed: {error}")
+        prompt_for_configuration()
+        load_configuration()
 
 
 def get_work_item_comments(work_item_tracking_client, work_item_id, pat):
@@ -414,7 +542,8 @@ def write_comments_csv(comments):
 
 
 def main():
-    load_configuration()
+    ensure_setup()
+    ensure_environment_variables()
     jira_api_token = get_required_environment_variable("JIRA_API_TOKEN")
     jira_issue_key = get_jira_issue_key()
     jira_issue_key_upper = jira_issue_key.upper()
@@ -422,12 +551,15 @@ def main():
         (
             prefix
             for prefix in ADO_CONFIGS
-            if jira_issue_key_upper.startswith(prefix)
+            if jira_issue_key_upper.startswith(prefix.upper())
         ),
         None,
     )
     if jira_prefix is None:
-        raise ValueError("The Jira issue key must begin with ORG1- or ORG2-.")
+        valid_prefixes = ", ".join(sorted(prefix.upper() for prefix in ADO_CONFIGS.keys()))
+        raise ValueError(
+            f"The Jira issue key must begin with one of: {valid_prefixes}."
+        )
 
     work_item_inputs = [
         work_item_input.strip()
@@ -441,17 +573,14 @@ def main():
     for work_item_input in work_item_inputs:
         if not work_item_input.isdigit():
             raise ValueError(f"'{work_item_input}' must be a numeric work item ID.")
+        pat_env_var = f"AZDO_{jira_prefix.upper()}_PAT"
         work_items.append(
             {
                 "display_id": work_item_input,
                 "work_item_id": int(work_item_input),
                 "prefix": jira_prefix,
                 "organization_url": config["organization_url"],
-                "pat": get_required_environment_variable(
-                    "AZDO_ORG1_PAT"
-                    if jira_prefix == "ORG1"
-                    else "AZDO_ORG2_PAT"
-                ),
+                "pat": get_required_environment_variable(pat_env_var),
             }
         )
     preview_only = input("Preview only? (y/n): ").strip().lower() in {"y", "yes"}
