@@ -1,0 +1,20 @@
+# Local environment files
+.env
+.env.*
+*.env
+ADO to JIRA/config.json
+
+# Generated output
+*.csv
+work_item_comments.csv
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Local editor settings
+.vscode/
+
+# Local working and archived copies
+archive/
+ADO to JIRA/ado_to_jira_sync.py

@@ -1,0 +1,14 @@
+{
+  "ado_configs": {
+    "ORG1": {
+      "organization_url": "https://dev.azure.com/your-organization-1"
+    },
+    "ORG2": {
+      "organization_url": "https://dev.azure.com/your-organization-2"
+    }
+  },
+  "jira": {
+    "base_url": "https://your-company.atlassian.net",
+    "email": "your.email@example.com"
+  }
+}
