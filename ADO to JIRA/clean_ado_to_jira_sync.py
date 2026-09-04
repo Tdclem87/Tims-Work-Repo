@@ -243,7 +243,7 @@ def load_configuration():
 
 
 def view_readme():
-    readme_path = Path(__file__).resolve().parent / "README.md"
+    readme_path = Path(__file__).resolve().parent.parent / "README.md"
     if not readme_path.exists():
         print(f"README not found: {readme_path}")
         return
