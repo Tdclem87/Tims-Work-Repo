@@ -739,6 +739,10 @@ def main():
     )
     config = ADO_CONFIGS[jira_prefix]
     LOGGER.info("Target Jira issue: %s", jira_issue_key)
+    print("\nADO work item matching:")
+    print("The script searched the Jira title/summary for the first standalone number with at least four digits.")
+    print(f"Jira title/summary: {jira_summary}")
+    print(f"Selected ADO work item ID: {', '.join(work_item_inputs)}")
     work_items = []
     for work_item_input in work_item_inputs:
         if not work_item_input.isdigit():
