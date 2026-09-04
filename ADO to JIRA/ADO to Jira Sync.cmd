@@ -14,7 +14,6 @@ set "PYTHON=%~dp0..\..\.venv\Scripts\python.exe"
 if not exist "%PYTHON%" set "PYTHON=python"
 
 :restart
-cls
 echo.
 echo ===== Azure DevOps to Jira Sync =====
 echo Starting a new run with %SCRIPT%...

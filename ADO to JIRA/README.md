@@ -35,6 +35,7 @@ The dependency list is stored in `requirements.txt` next to the scripts.
 ## What the sync does
 
 - Reads comments and attachments from Azure DevOps work items.
+- Posts each work item's current state, last changed-by identity, and last changed timestamp into a Jira status comment.
 - Converts HTML comment content into readable Jira text.
 - Uploads work item attachments and comment-linked screenshots to Jira.
 - Streams attachment downloads and uploads instead of loading entire files into memory.
@@ -173,6 +174,7 @@ Double-click `ADO to Jira Sync.cmd` to launch the application. The launcher pref
 - falls back to `clean_ado_to_jira_sync.py` for a public-safe checkout
 - keeps the console open after each run
 - automatically starts the first prompt again after the run finishes
+- preserves the previous run's console history instead of clearing the screen
 
 You can also start it from PowerShell or Command Prompt:
 
@@ -182,7 +184,9 @@ You can also start it from PowerShell or Command Prompt:
 
 The launcher does not contain credentials. Tokens continue to come from Windows environment variables.
 
-The script will ask for the Jira issue key and comma-separated work item IDs. It then asks `Preview first?`. After retrieval, it displays the number of comments, attachments, and retrieval failures found. Review that output, then answer `Continue posting to Jira?` with `Y` to upload attachments and add comments, or `N` to cancel without Jira changes.
+The script asks for the Jira issue key, then reads the Jira summary/title and automatically extracts the first standalone ADO work item number. Titles such as `196236 - IRP-PRIO-INC000037757282 - Error message` and `BUG 522880 - MPI Registration` produce ADO IDs `196236` and `522880`; the embedded incident number in the first title is ignored. If no four-or-more-digit number is found, the run stops with an error instead of asking for a replacement ID. It then asks `Preview first?`. After retrieval, it displays the number of comments, attachments, status records, and retrieval failures found. Review that output, then answer `Continue posting to Jira?` with `Y` to upload attachments, add comments, and post status summaries, or `N` to cancel without Jira changes.
+
+Status comments use a hidden marker containing the work item ID, state, and changed timestamp. This prevents the same status version from being posted repeatedly while allowing a new Jira status comment when the ADO state changes.
 
 You can also type `R` at the Jira key prompt to view this README from the script.
 

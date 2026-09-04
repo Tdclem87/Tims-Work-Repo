@@ -39,6 +39,11 @@ class SessionLogFilter(logging.Filter):
         return True
 
 
+class ConsoleVisibilityFilter(logging.Filter):
+    def filter(self, record):
+        return getattr(record, "show_console", True)
+
+
 def update_run_state(status, **updates):
     RUN_STATE.update(
         {
@@ -74,6 +79,7 @@ def configure_logging():
     LOGGER.addHandler(handler)
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    console_handler.addFilter(ConsoleVisibilityFilter())
     LOGGER.addHandler(console_handler)
     LOGGER.setLevel(logging.INFO)
     LOGGER.propagate = False
@@ -391,8 +397,8 @@ def ensure_setup():
         load_configuration()
 
 
-def get_work_item_comments(work_item_tracking_client, work_item_id, pat):
-    work_item = work_item_tracking_client.get_work_item(work_item_id)
+def get_work_item_comments(work_item_tracking_client, work_item_id, pat, work_item=None):
+    work_item = work_item or work_item_tracking_client.get_work_item(work_item_id)
     links = work_item._links.additional_properties
     comments_link = links.get("workItemComments", {}).get("href")
 
@@ -416,6 +422,24 @@ def get_work_item_comments(work_item_tracking_client, work_item_id, pat):
         continuation_token = response.headers.get("x-ms-continuationtoken")
         if not continuation_token:
             return comments
+
+
+def get_work_item_status(work_item, work_item_id):
+    fields = getattr(work_item, "fields", {}) or {}
+    changed_by = fields.get("System.ChangedBy") or "Unknown"
+    if isinstance(changed_by, dict):
+        changed_by = (
+            changed_by.get("displayName")
+            or changed_by.get("uniqueName")
+            or changed_by.get("id")
+            or "Unknown"
+        )
+    return {
+        "work_item_id": work_item_id,
+        "state": fields.get("System.State") or "Unknown",
+        "changed_by": changed_by,
+        "changed_date": fields.get("System.ChangedDate") or "Unknown",
+    }
 
 
 def get_work_item_attachments(organization_url, work_item_id, pat):
@@ -442,14 +466,27 @@ def get_work_item_attachments(organization_url, work_item_id, pat):
 def get_jira_issue_data(issue_key, jira_api_token):
     response = SESSION.get(
         f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}",
-        params={"fields": "attachment,comment"},
+        params={"fields": "summary,attachment,comment"},
         auth=(JIRA_EMAIL, jira_api_token),
         headers={"Accept": "application/json"},
         timeout=30,
     )
     response.raise_for_status()
     fields = response.json().get("fields", {})
-    return fields.get("attachment", []), fields.get("comment", {}).get("comments", [])
+    return (
+        fields.get("summary", ""),
+        fields.get("attachment", []),
+        fields.get("comment", {}).get("comments", []),
+    )
+
+
+def extract_ado_work_item_ids(summary):
+    match = re.search(r"(?<!\d)\d{4,}(?!\d)", summary or "")
+    if not match:
+        raise ValueError(
+            "No ADO work item number was found in the Jira issue summary."
+        )
+    return [match.group(0)]
 
 
 def upload_jira_attachment(
@@ -682,13 +719,19 @@ def main():
         )
     LOGGER.info("Validated Jira issue key prefix.")
 
-    work_item_inputs = [
-        work_item_input.strip()
-        for work_item_input in get_required_input(
-            "Azure DevOps work item IDs (comma-separated): "
-        ).split(",")
-        if work_item_input.strip()
-    ]
+    try:
+        jira_summary, jira_attachments, jira_comments = get_jira_issue_data(
+            jira_issue_key, jira_api_token
+        )
+    except requests.RequestException as error:
+        raise RuntimeError(f"Could not read Jira issue {jira_issue_key}: {error}") from error
+
+    work_item_inputs = extract_ado_work_item_ids(jira_summary)
+    LOGGER.info(
+        "Found ADO work item ID(s) in Jira summary '%s': %s",
+        jira_summary,
+        ", ".join(work_item_inputs),
+    )
     update_run_state(
         "running",
         jira_issue_key=jira_issue_key,
@@ -715,6 +758,7 @@ def main():
 
     comments = []
     attachments = []
+    work_item_statuses = []
     failures = []
     for work_item in work_items:
         work_item_id = work_item["work_item_id"]
@@ -725,8 +769,13 @@ def main():
                 creds=credentials,
             )
             work_item_tracking_client = connection.clients.get_work_item_tracking_client()
+            ado_work_item = work_item_tracking_client.get_work_item(work_item_id)
+            work_item_statuses.append(get_work_item_status(ado_work_item, work_item_id))
             for comment in get_work_item_comments(
-                work_item_tracking_client, work_item_id, work_item["pat"]
+                work_item_tracking_client,
+                work_item_id,
+                work_item["pat"],
+                work_item=ado_work_item,
             ):
                 raw_text = comment.get("text", "")
                 comments.append(
@@ -764,13 +813,6 @@ def main():
         len(attachments),
     )
 
-    try:
-        jira_attachments, jira_comments = get_jira_issue_data(
-            jira_issue_key, jira_api_token
-        )
-    except requests.RequestException as error:
-        raise RuntimeError(f"Could not read Jira issue {jira_issue_key}: {error}") from error
-
     existing_comment_text = {
         get_jira_comment_text(comment.get("body", {}))
         for comment in jira_comments
@@ -801,11 +843,32 @@ def main():
                 },
             )
 
-    LOGGER.info("Found %d ADO comments.", len(comments))
-    LOGGER.info("Found %d unique ADO attachments.", len(unique_attachments))
-    LOGGER.info("Target Jira issue: %s", jira_issue_key)
+    LOGGER.info(
+        "Found %d ADO comments.",
+        len(comments),
+        extra={"show_console": preview_first},
+    )
+    LOGGER.info(
+        "Found %d unique ADO attachments.",
+        len(unique_attachments),
+        extra={"show_console": preview_first},
+    )
+    LOGGER.info(
+        "Found status information for %d work item(s).",
+        len(work_item_statuses),
+        extra={"show_console": preview_first},
+    )
+    LOGGER.info(
+        "Target Jira issue: %s",
+        jira_issue_key,
+        extra={"show_console": preview_first},
+    )
     if failures:
-        LOGGER.warning("Encountered %d retrieval failure(s).", len(failures))
+        LOGGER.warning(
+            "Encountered %d retrieval failure(s).",
+            len(failures),
+            extra={"show_console": preview_first},
+        )
     if preview_first:
         LOGGER.info("Preview displayed before Jira posting.")
 
@@ -879,6 +942,51 @@ def main():
             LOGGER.error("Jira comment post failed for %s: %s", comment['CommentCreatedBy'], error)
             failures.append(f"Comment from {comment['CommentCreatedBy']}: {error}")
 
+    status_posted_count = 0
+    seen_status_markers = set()
+    for work_item_status in work_item_statuses:
+        changed_date = work_item_status["changed_date"]
+        status_marker = (
+            f"[ADO_TO_JIRA_STATE:{work_item_status['work_item_id']}:"
+            f"{work_item_status['state']}:{changed_date}]"
+        )
+        if status_marker in seen_status_markers or any(
+            status_marker in text for text in existing_comment_text
+        ):
+            continue
+        status_header = (
+            f"{status_marker} ADO work item {work_item_status['work_item_id']} status"
+        )
+        status_body = (
+            f"State: {work_item_status['state']}\n"
+            f"Last changed by: {work_item_status['changed_by']}\n"
+            f"Last changed: {format_ado_timestamp(changed_date)}"
+        )
+        try:
+            add_jira_comment(
+                jira_issue_key,
+                status_header,
+                status_body,
+                [],
+                jira_api_token,
+            )
+            status_posted_count += 1
+            seen_status_markers.add(status_marker)
+            existing_comment_text.add(status_marker)
+            LOGGER.info(
+                "Posted status for ADO work item %s.",
+                work_item_status["work_item_id"],
+            )
+        except requests.RequestException as error:
+            failures.append(
+                f"Status for work item {work_item_status['work_item_id']}: {error}"
+            )
+            LOGGER.error(
+                "Jira status post failed for work item %s: %s",
+                work_item_status["work_item_id"],
+                error,
+            )
+
     if fallback_links:
         link_header = "[ADO_TO_JIRA_LINKS] Attachments not uploaded"
         link_body = (
@@ -904,6 +1012,7 @@ def main():
     update_run_state(
         "completed",
         posted_comments=posted_count,
+        posted_status_comments=status_posted_count,
         skipped_duplicates=skipped_count,
         failures=len(failures),
     )

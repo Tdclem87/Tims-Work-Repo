@@ -10,7 +10,6 @@ if (-not (Test-Path $pythonPath)) {
 }
 
 while ($true) {
-    Clear-Host
     Write-Host ""
     Write-Host "===== Azure DevOps to Jira Sync =====" -ForegroundColor Green
     Write-Host "Starting a new run with $scriptName..."
