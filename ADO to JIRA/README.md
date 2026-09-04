@@ -9,6 +9,8 @@ This repo is intentionally split into public-safe and local-only files:
 - `clean_ado_to_jira_sync.py` - public-safe version for GitHub
 - `config.example.json` - example configuration template
 - `README.md` - public documentation
+- `ADO to Jira Sync.cmd` - Windows launcher and Command Prompt fallback
+- `ADO to Jira Sync.ps1` - preferred persistent PowerShell launcher
 - `ado_to_jira_sync.py` - local working copy kept on your machine
 - `config.json` - local configuration file with your actual org URLs and Jira email
 
@@ -25,8 +27,19 @@ Keep the local working script and local config file off Git. The public repo sho
 ## Install dependencies
 
 ```powershell
-python -m pip install requests azure-devops msrest
+python -m pip install requests azure-devops msrest requests-toolbelt
 ```
+
+## What the sync does
+
+- Reads comments and attachments from Azure DevOps work items.
+- Converts HTML comment content into readable Jira text.
+- Uploads work item attachments and comment-linked screenshots to Jira.
+- Streams attachment downloads and uploads instead of loading entire files into memory.
+- Stores a clickable Jira link when an attachment exceeds the configured size limit.
+- Avoids reposting matching Jira comments and existing attachment filenames.
+- Supports multiple Azure DevOps organizations using configurable Jira prefixes.
+- Writes the retrieved comments to `work_item_comments.csv` for review.
 
 ## First-time setup
 
@@ -60,6 +73,8 @@ Example format:
 	}
 }
 ```
+
+The optional `max_attachment_size_mb` setting controls the upload limit. It defaults to `100` when omitted. Attachments larger than this limit are not uploaded; their Azure DevOps links are posted to Jira instead.
 
 The organization prefix is used to build the expected environment variable name for that PAT.
 
@@ -163,11 +178,17 @@ You can also start it from PowerShell or Command Prompt:
 
 The launcher does not contain credentials. Tokens continue to come from Windows environment variables.
 
-The script will ask for the Jira issue key and work item IDs. It then asks `Preview first?` and displays the number of comments, attachments, and retrieval failures found. After reviewing the preview, answer `Continue posting to Jira?` with `Y` to make the Jira changes or `N` to cancel.
+The script will ask for the Jira issue key and comma-separated work item IDs. It then asks `Preview first?`. After retrieval, it displays the number of comments, attachments, and retrieval failures found. Review that output, then answer `Continue posting to Jira?` with `Y` to upload attachments and add comments, or `N` to cancel without Jira changes.
 
 You can also type `R` at the Jira key prompt to view this README from the script.
 
 The CSV export is written next to the script as `work_item_comments.csv`.
+
+## Local activity logs
+
+Each script writes activity and error information to a local `logs` folder next to the script. The log file is named `activity.log` and rotates at midnight. The current file plus up to 89 previous daily files are retained, so logs are kept for no more than 90 daily files.
+
+Logs include setup events, retrieval counts, preview and cancellation decisions, upload/post results, and error details. Tokens, PAT values, and other credential values are never written to the logs. The `logs` folder is ignored by Git and should remain local.
 
 ## Security guidance
 
@@ -175,7 +196,7 @@ The CSV export is written next to the script as `work_item_comments.csv`.
 - Never commit PATs, API tokens, `.env` files, or generated CSV exports.
 - Keep the public repo limited to safe shareable files.
 - Rotate any credential that may have been exposed.
-- Review the destination Jira issue before sending changes without preview mode.
+- Review the preview and destination Jira issue before answering `Continue posting to Jira?` with `Y`.
 
 ## Public-safe workflow
 

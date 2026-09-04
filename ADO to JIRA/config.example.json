@@ -10,5 +10,6 @@
   "jira": {
     "base_url": "https://your-company.atlassian.net",
     "email": "your.email@example.com"
-  }
+  },
+  "max_attachment_size_mb": 100
 }

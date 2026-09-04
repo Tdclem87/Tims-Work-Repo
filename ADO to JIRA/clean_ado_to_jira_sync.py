@@ -1,22 +1,51 @@
 import csv
 import json
+import logging
 import os
 import re
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from html.parser import HTMLParser
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import requests
 from azure.devops.connection import Connection
 from msrest.authentication import BasicAuthentication
+from requests_toolbelt.multipart.encoder import MultipartEncoder
 
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+DEFAULT_MAX_ATTACHMENT_SIZE_MB = 100
 ADO_CONFIGS = {}
 JIRA_BASE_URL = ""
 JIRA_EMAIL = ""
+MAX_ATTACHMENT_BYTES = DEFAULT_MAX_ATTACHMENT_SIZE_MB * 1024 * 1024
+LOGGER = logging.getLogger("ado_to_jira_sync")
+
+
+def configure_logging():
+    LOG_DIR.mkdir(exist_ok=True)
+    if LOGGER.handlers:
+        return
+
+    handler = TimedRotatingFileHandler(
+        LOG_DIR / "activity.log",
+        when="midnight",
+        interval=1,
+        backupCount=89,
+        encoding="utf-8",
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    )
+    LOGGER.addHandler(handler)
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+    LOGGER.info("Logging started.")
 
 
 class CommentTextParser(HTMLParser):
@@ -140,7 +169,7 @@ def get_required_environment_variable(name):
 
 
 def load_configuration():
-    global ADO_CONFIGS, JIRA_BASE_URL, JIRA_EMAIL
+    global ADO_CONFIGS, JIRA_BASE_URL, JIRA_EMAIL, MAX_ATTACHMENT_BYTES
 
     if not CONFIG_PATH.exists():
         raise RuntimeError(
@@ -160,10 +189,19 @@ def load_configuration():
         jira_configuration = configuration["jira"]
         JIRA_BASE_URL = jira_configuration["base_url"].rstrip("/")
         JIRA_EMAIL = jira_configuration["email"]
+        max_attachment_size_mb = configuration.get(
+            "max_attachment_size_mb", DEFAULT_MAX_ATTACHMENT_SIZE_MB
+        )
+        if not isinstance(max_attachment_size_mb, (int, float)) or max_attachment_size_mb <= 0:
+            raise ValueError("max_attachment_size_mb must be greater than 0.")
+        MAX_ATTACHMENT_BYTES = int(max_attachment_size_mb * 1024 * 1024)
     except (KeyError, TypeError, AttributeError) as error:
         raise RuntimeError(
             "Configuration must include ado_configs and jira settings."
         ) from error
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
+    LOGGER.info("Loaded configuration for %d Azure DevOps organization(s).", len(ADO_CONFIGS))
 
 
 def view_readme():
@@ -206,6 +244,7 @@ def launch_windows_environment_variables():
 
 
 def prompt_for_configuration():
+    LOGGER.info("Initial configuration setup started.")
     print("\nInitial setup is required.")
     print("This will create a local config file and save it next to this script.")
     print("Your PATs and Jira token will stay in Windows environment variables.")
@@ -252,6 +291,7 @@ def prompt_for_configuration():
         },
     }
     CONFIG_PATH.write_text(json.dumps(configuration, indent=2), encoding="utf-8")
+    LOGGER.info("Initial configuration saved.")
     print(f"Configuration saved to: {CONFIG_PATH}")
 
 
@@ -262,8 +302,10 @@ def ensure_environment_variables():
 
     missing = [name for name in required_vars if not os.environ.get(name)]
     if not missing:
+        LOGGER.info("All required environment variables are available.")
         return
 
+    LOGGER.warning("Missing %d required environment variable(s).", len(missing))
     print("\nMissing environment variables:")
     for name in missing:
         print(f"- {name} ({required_vars[name]})")
@@ -303,6 +345,7 @@ def ensure_environment_variables():
 
 def ensure_setup():
     if not CONFIG_PATH.exists():
+        LOGGER.info("Configuration file is missing; starting guided setup.")
         prompt_for_configuration()
         load_configuration()
         return
@@ -310,6 +353,7 @@ def ensure_setup():
     try:
         load_configuration()
     except RuntimeError as error:
+        LOGGER.error("Configuration check failed: %s", error)
         print(f"Configuration check failed: {error}")
         prompt_for_configuration()
         load_configuration()
@@ -381,31 +425,72 @@ def upload_jira_attachment(
 ):
     filename = get_attachment_filename(attachment)
     if filename in existing_filenames:
-        return None, f"Skipped existing Jira attachment: {filename}"
+        return None, f"Skipped existing Jira attachment: {filename}", None
 
-    response = requests.get(
-        attachment["url"],
-        auth=("", pat),
-        timeout=30,
-    )
-    response.raise_for_status()
-    upload_response = requests.post(
-        f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/attachments",
-        auth=(JIRA_EMAIL, jira_api_token),
-        headers={"X-Atlassian-Token": "no-check"},
-        files={
-            "file": (
-                filename,
-                response.content,
-                response.headers.get("Content-Type", "application/octet-stream"),
+    temporary_path = None
+    try:
+        with requests.get(
+            attachment["url"],
+            auth=("", pat),
+            stream=True,
+            timeout=30,
+        ) as response:
+            response.raise_for_status()
+            content_length = response.headers.get("Content-Length")
+            if content_length and int(content_length) > MAX_ATTACHMENT_BYTES:
+                message = (
+                    f"Stored link for oversized attachment: {filename} "
+                    f"(limit {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB)"
+                )
+                return None, message, {
+                    "filename": filename,
+                    "url": attachment["url"],
+                }
+
+            with tempfile.NamedTemporaryFile(delete=False) as temporary_file:
+                temporary_path = temporary_file.name
+                total_bytes = 0
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    total_bytes += len(chunk)
+                    if total_bytes > MAX_ATTACHMENT_BYTES:
+                        message = (
+                            f"Stored link for oversized attachment: {filename} "
+                            f"(limit {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB)"
+                        )
+                        return None, message, {
+                            "filename": filename,
+                            "url": attachment["url"],
+                        }
+                    temporary_file.write(chunk)
+            content_type = response.headers.get(
+                "Content-Type", "application/octet-stream"
             )
-        },
-        timeout=30,
-    )
-    upload_response.raise_for_status()
-    uploaded_attachment = upload_response.json()[0]
-    existing_filenames.add(filename)
-    return uploaded_attachment, f"Uploaded attachment: {filename}"
+
+        with open(temporary_path, "rb") as attachment_file:
+            encoder = MultipartEncoder(
+                fields={
+                    "file": (filename, attachment_file, content_type),
+                }
+            )
+            upload_response = requests.post(
+                f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/attachments",
+                auth=(JIRA_EMAIL, jira_api_token),
+                headers={
+                    "X-Atlassian-Token": "no-check",
+                    "Content-Type": encoder.content_type,
+                },
+                data=encoder,
+                timeout=30,
+            )
+            upload_response.raise_for_status()
+        uploaded_attachment = upload_response.json()[0]
+        existing_filenames.add(filename)
+        return uploaded_attachment, f"Uploaded attachment: {filename}", None
+    finally:
+        if temporary_path:
+            Path(temporary_path).unlink(missing_ok=True)
 
 
 def jira_text_nodes(text):
@@ -542,6 +627,8 @@ def write_comments_csv(comments):
 
 
 def main():
+    configure_logging()
+    LOGGER.info("Sync run started.")
     ensure_setup()
     ensure_environment_variables()
     jira_api_token = get_required_environment_variable("JIRA_API_TOKEN")
@@ -560,6 +647,7 @@ def main():
         raise ValueError(
             f"The Jira issue key must begin with one of: {valid_prefixes}."
         )
+    LOGGER.info("Validated Jira issue key prefix.")
 
     work_item_inputs = [
         work_item_input.strip()
@@ -622,12 +710,19 @@ def main():
                 attachment["pat"] = work_item["pat"]
             attachments.extend(ado_attachments)
         except requests.RequestException as error:
+            LOGGER.error("Azure DevOps request failed for work item %s: %s", work_item_id, error)
             failures.append(f"ADO work item {work_item_id}: {error}")
         except Exception as error:
+            LOGGER.exception("Unexpected error retrieving work item %s.", work_item_id)
             failures.append(f"ADO work item {work_item_id}: {error}")
 
     comments.sort(key=comment_timestamp_sort_key)
     write_comments_csv(comments)
+    LOGGER.info(
+        "Retrieved %d comment(s) and %d attachment(s); CSV export written.",
+        len(comments),
+        len(attachments),
+    )
 
     try:
         jira_attachments, jira_comments = get_jira_issue_data(
@@ -673,15 +768,18 @@ def main():
         print(f"Encountered {len(failures)} retrieval failure(s).")
     if preview_first:
         print("Preview complete. No Jira changes have been made yet.")
+        LOGGER.info("Preview displayed before Jira posting.")
 
     if input("Continue posting to Jira? (y/n): ").strip().lower() not in {"y", "yes"}:
+        LOGGER.info("Sync cancelled before Jira posting.")
         print("Cancelled; no Jira updates were made.")
         return
 
     uploaded_by_url = {}
+    fallback_links = {}
     for attachment in unique_attachments.values():
         try:
-            uploaded_attachment, message = upload_jira_attachment(
+            uploaded_attachment, message, fallback_link = upload_jira_attachment(
                 jira_issue_key,
                 attachment,
                 attachment["pat"],
@@ -689,12 +787,16 @@ def main():
                 existing_filenames,
             )
             print(message)
+            LOGGER.info(message)
+            if fallback_link:
+                fallback_links[fallback_link["url"]] = fallback_link
             if uploaded_attachment:
                 uploaded_by_url[attachment["url"]] = {
                     "filename": uploaded_attachment["filename"],
                     "url": uploaded_attachment["content"],
                 }
         except (requests.RequestException, KeyError) as error:
+            LOGGER.error("Attachment upload failed for %s: %s", attachment["name"], error)
             failures.append(f"Attachment {attachment['name']}: {error}")
             print(f"Failed attachment {attachment['name']}: {error}")
 
@@ -719,6 +821,13 @@ def main():
             )
             if comment_attachment["url"] in uploaded_by_url
         ]
+        attachment_links.extend(
+            fallback_links[comment_attachment["url"]]
+            for comment_attachment in get_comment_attachment_urls(
+                comment["CommentText"]
+            )
+            if comment_attachment["url"] in fallback_links
+        )
         try:
             add_jira_comment(
                 jira_issue_key,
@@ -728,11 +837,35 @@ def main():
                 jira_api_token,
             )
             posted_count += 1
+            LOGGER.info("Posted one Jira comment.")
         except requests.RequestException as error:
+            LOGGER.error("Jira comment post failed for %s: %s", comment['CommentCreatedBy'], error)
             failures.append(f"Comment from {comment['CommentCreatedBy']}: {error}")
             print(f"Failed comment from {comment['CommentCreatedBy']}: {error}")
 
+    if fallback_links:
+        link_header = "[ADO_TO_JIRA_LINKS] Attachments not uploaded"
+        link_body = (
+            "These Azure DevOps attachments exceeded the configured upload limit "
+            "and were stored as links instead."
+        )
+        if link_header + link_body not in existing_comment_text:
+            add_jira_comment(
+                jira_issue_key,
+                link_header,
+                link_body,
+                list(fallback_links.values()),
+                jira_api_token,
+            )
+            LOGGER.info("Posted %d oversized attachment link(s).", len(fallback_links))
+
     print(f"Posted {posted_count} Jira comments; skipped {skipped_count} duplicates.")
+    LOGGER.info(
+        "Sync run completed: posted %d comment(s), skipped %d duplicate(s), failures %d.",
+        posted_count,
+        skipped_count,
+        len(failures),
+    )
     if failures:
         print("Failures:")
         for failure in failures:
@@ -742,5 +875,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (KeyError, ValueError, RuntimeError) as error:
+    except Exception as error:
+        configure_logging()
+        LOGGER.exception("Run stopped with error: %s", error)
         raise SystemExit(f"Error: {error}") from error
